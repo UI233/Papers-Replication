@@ -3,24 +3,12 @@
 #include "Eigen/Core"
 #include <algorithm>
 #include <iostream>
+#include <fstream>
 #include <set>
+#include <numeric>
 
 // Project the point onto the unit square from a circle
-OpenMesh::Vec2f project2Square(float theta) {
-    //int quard = theta / (0.5 * M_PI);
-    //quard = std::min(quard, 3);
-    //theta -= 0.25 * M_PI;
-    //switch (quard)
-    //{
-    //case 0:
-    //   return OpenMesh::Vec2f(1.0f, tanf(theta));
-    //case 1:
-    //    return OpenMesh::Vec2f(1.0f / tanf(theta), 1.0f);
-    //case 2:
-    //    return OpenMesh::Vec2f(-1.0f, -tanf(theta));
-    //case 3:
-    //    return OpenMesh::Vec2f(-1.0f / tanf(theta), -1.0f);
-    //}
+OpenMesh::Vec2f project2Circle(double theta) {
     return OpenMesh::Vec2f(cosf(theta), sinf(theta));
 }
 
@@ -51,8 +39,8 @@ std::vector<OpenMesh::Vec2f> init(Mesh& mesh) {
         std::vector<bool> visited;
         visited.resize(vertices_sz);
         std::fill(visited.begin(), visited.end(), 0);
-        float angle = 0.0f;
-        float length = 0.0f;
+        double angle = 0.0f;
+        double length = 0.0f;
         // compute the total length
         for (auto st = *boundaries.begin(); !visited[st.idx()];) {
             visited[st.idx()] = true;
@@ -73,14 +61,14 @@ std::vector<OpenMesh::Vec2f> init(Mesh& mesh) {
 
         // compute the boundary point
         std::fill(visited.begin(), visited.end(), 0);
-        res[(*boundaries.begin()).idx()] = project2Square(0.0f);
+        res[(*boundaries.begin()).idx()] = project2Circle(0.0f);
         for (auto st = *boundaries.begin(); !visited[st.idx()];) {
             visited[st.idx()] = true;
             for (auto nx = mesh.vv_begin(st); nx.is_valid(); ++nx){ 
                 if (boundaries.count(nx.handle()) && !visited[nx.handle().idx()]) {
                     angle += 2.0 * M_PI * (mesh.point(nx) - mesh.point(st)).norm() / length;
                     st = nx;
-                    res[nx.handle().idx()] = project2Square(angle);
+                    res[nx.handle().idx()] = project2Circle(angle);
                     break;
                 }
             }
@@ -141,7 +129,6 @@ auto calcGrad(const Mesh& mesh, const std::vector<OpenMesh::Vec2f> &vecs) -> std
     for (auto v = mesh.vertices_begin(); v != mesh.vertices_end(); ++v) {
         res[v.handle().idx()][0] = 0.0f;
         res[v.handle().idx()][1] = 0.0f;
-        auto st = mesh.cvv_begin(v);
         for (auto face: mesh.vf_range(v)){
             int cnt = 0;
             OpenMesh::VertexHandle nv, nx;
@@ -155,9 +142,9 @@ auto calcGrad(const Mesh& mesh, const std::vector<OpenMesh::Vec2f> &vecs) -> std
             auto E1 = mesh.point(nv) - mesh.point(v);
             auto E2 = mesh.point(nx) - mesh.point(v);
 
-            float x = E1.norm();
-            float e2_comp_x = OpenMesh::dot(E1, E2) / x;
-            float y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
+            double x = E1.norm();
+            double e2_comp_x = OpenMesh::dot(E1, E2) / x;
+            double y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
 
             // The Matrix A = ((p1 - p0) / x, ((p2 - p0) - (p1 - p0) * e2_comp_x / x) / y)
             // calculate the row vector of Matrix A
@@ -170,12 +157,12 @@ auto calcGrad(const Mesh& mesh, const std::vector<OpenMesh::Vec2f> &vecs) -> std
             const OpenMesh::Vec2f c1 = (e1 - e0 * e2_comp_x / x) / y;
             // E(A) = trace(AA') / det(A)
             // calculate the \partial{E(A)} / \partial{p0.x} and \partial{E(A)}/ \partial{p0.y}
-            float mdet = c0[0] * c1[1] - c0[1] * c1[0];
-            float traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
-            float dtraTa_dx = 2 * c0[0] / (-x) + 2 * c1[0] * (e2_comp_x / x - 1.0) / y;
-            float dtraTa_dy = 2 * c0[1] / (-x) + 2 * c1[1] * (e2_comp_x / x - 1.0) / y;
-            float dDet_dx = c1[1] / (-x) - c0[1] * (e2_comp_x / x - 1.0) / y;
-            float dDet_dy = c0[0] * (e2_comp_x / x - 1.0) / y - c1[0] / (-x);
+            double mdet = c0[0] * c1[1] - c0[1] * c1[0];
+            double traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
+            double dtraTa_dx = 2 * c0[0] / (-x) + 2 * c1[0] * (e2_comp_x / x - 1.0) / y;
+            double dtraTa_dy = 2 * c0[1] / (-x) + 2 * c1[1] * (e2_comp_x / x - 1.0) / y;
+            double dDet_dx = c1[1] / (-x) - c0[1] * (e2_comp_x / x - 1.0) / y;
+            double dDet_dy = c0[0] * (e2_comp_x / x - 1.0) / y - c1[0] / (-x);
             if (mdet < 0.0f) {
                 mdet = -mdet;
                 dDet_dx = -dDet_dx;
@@ -186,6 +173,58 @@ auto calcGrad(const Mesh& mesh, const std::vector<OpenMesh::Vec2f> &vecs) -> std
         }
     }
 
+    return std::move(res);
+}
+
+auto calcGrad(const Mesh &mesh, const Eigen::VectorXd &vecs) -> Eigen::VectorXd {
+    Eigen::VectorXd res(vecs.size() * 2);
+    constexpr int coord = 2;
+    for (auto v = mesh.vertices_begin(); v != mesh.vertices_end(); ++v) {
+        res[coord * v.handle().idx()] = 0.0f;
+        res[coord * v.handle().idx() + 1] = 0.0f;
+        for (auto face: mesh.vf_range(v)){
+            int cnt = 0;
+            OpenMesh::VertexHandle nv, nx;
+            for (auto adjv: mesh.fv_range(face)) {
+                if (adjv != v) {
+                    if (cnt++ == 0)
+                        nv = adjv;
+                    else nx = adjv;
+                }
+            }
+            auto E1 = mesh.point(nv) - mesh.point(v);
+            auto E2 = mesh.point(nx) - mesh.point(v);
+
+            double x = E1.norm();
+            double e2_comp_x = OpenMesh::dot(E1, E2) / x;
+            double y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
+
+            // The Matrix A = ((p1 - p0) / x, ((p2 - p0) - (p1 - p0) * e2_comp_x / x) / y)
+            // calculate the row vector of Matrix A
+            const OpenMesh::Vec2f& p0 = OpenMesh::Vec2f(vecs[coord * v.handle().idx()], vecs[coord * v.handle().idx() + 1]);
+            const OpenMesh::Vec2f& p1 = OpenMesh::Vec2f(vecs[coord * nv.idx()], vecs[coord * nv.idx() + 1]);
+            const OpenMesh::Vec2f& p2 = OpenMesh::Vec2f(vecs[coord * nx.idx()], vecs[coord * nx.idx() + 1]);
+            const OpenMesh::Vec2f e0 = p1 - p0;
+            const OpenMesh::Vec2f e1 = p2 - p0;
+            const OpenMesh::Vec2f c0 = (e0 / x);
+            const OpenMesh::Vec2f c1 = (e1 - e0 * e2_comp_x / x) / y;
+            // E(A) = trace(AA') / det(A)
+            // calculate the \partial{E(A)} / \partial{p0.x} and \partial{E(A)}/ \partial{p0.y}
+            double mdet = c0[0] * c1[1] - c0[1] * c1[0];
+            double traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
+            double dtraTa_dx = 2 * c0[0] / (-x) + 2 * c1[0] * (e2_comp_x / x - 1.0) / y;
+            double dtraTa_dy = 2 * c0[1] / (-x) + 2 * c1[1] * (e2_comp_x / x - 1.0) / y;
+            double dDet_dx = c1[1] / (-x) - c0[1] * (e2_comp_x / x - 1.0) / y;
+            double dDet_dy = c0[0] * (e2_comp_x / x - 1.0) / y - c1[0] / (-x);
+            if (mdet < 0.0f) {
+                mdet = -mdet;
+                dDet_dx = -dDet_dx;
+                dDet_dy = -dDet_dy;
+            }
+            res[coord * v.handle().idx()] += (dtraTa_dx * mdet - traTa * dDet_dx)/ (mdet * mdet);
+            res[coord * v.handle().idx() + 1] += (dtraTa_dy * mdet - traTa * dDet_dy)/ (mdet * mdet);
+        }
+    }
     return std::move(res);
 }
 
@@ -205,9 +244,9 @@ double energy(const Mesh &mesh, std::vector<OpenMesh::Vec2f>& vecs) {
         auto E1 = p[1] - p[0];
         auto E2 = p[2] - p[0];
 
-        float x = E1.norm();
-        float e2_comp_x = OpenMesh::dot(E1, E2) / x;
-        float y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
+        double x = E1.norm();
+        double e2_comp_x = OpenMesh::dot(E1, E2) / x;
+        double y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
 
         // The Matrix A = ((p1 - p0) / x, ((p2 - p0) - (p1 - p0) * e2_comp_x / x) / y)
         // calculate the row vector of Matrix A
@@ -220,11 +259,11 @@ double energy(const Mesh &mesh, std::vector<OpenMesh::Vec2f>& vecs) {
         const OpenMesh::Vec2f c1 = (e1 - e0 * e2_comp_x / x) / y;
         // E(A) = trace(AA') / det(A)
         // calculate the \partial{E(A)} / \partial{p0.x} and \partial{E(A)}/ \partial{p0.y}
-        float mdet = c0[0] * c1[1] - c0[1] * c1[0];
+        double mdet = c0[0] * c1[1] - c0[1] * c1[0];
         if (mdet < 0.0f)
             mdet = -mdet;
-        float traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
-        float ene = traTa / mdet;
+        double traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
+        double ene = traTa / mdet;
         
         if (std::isinf(ene)) {
             std::cout << "stop";
@@ -236,50 +275,174 @@ double energy(const Mesh &mesh, std::vector<OpenMesh::Vec2f>& vecs) {
     return E;
 }
 
-void gradientDescent(const Mesh& mesh, std::vector<OpenMesh::Vec2f>& init, float step = 0.005f) {
-    constexpr float threshold = 0.0005f;
+double energy(const Mesh &mesh, const Eigen::VectorXd& vecs) {
+    double E = 0.0;
+    for (auto face: mesh.all_faces()) {
+        OpenMesh::Vec3f p[3];
+        int handles[3];
+        int cnt = 0;
+        
+        for (auto v: mesh.fv_range(face))  {
+            handles[cnt] = v.idx();
+            p[cnt] = mesh.point(v);
+            ++cnt;
+        }
+
+        auto E1 = p[1] - p[0];
+        auto E2 = p[2] - p[0];
+
+        double x = E1.norm();
+        double e2_comp_x = OpenMesh::dot(E1, E2) / x;
+        double y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
+
+        // The Matrix A = ((p1 - p0) / x, ((p2 - p0) - (p1 - p0) * e2_comp_x / x) / y)
+        // calculate the row vector of Matrix A
+        constexpr int coord = 2;
+        const OpenMesh::Vec2f& p0 = OpenMesh::Vec2f(vecs[coord * handles[0]], vecs[coord * handles[0] + 1]);
+        const OpenMesh::Vec2f& p1 = OpenMesh::Vec2f(vecs[coord * handles[1]], vecs[coord * handles[1] + 1]);
+        const OpenMesh::Vec2f& p2 = OpenMesh::Vec2f(vecs[coord * handles[2]], vecs[coord * handles[2] + 1]);
+        const OpenMesh::Vec2f e0 = p1 - p0;
+        const OpenMesh::Vec2f e1 = p2 - p0;
+        const OpenMesh::Vec2f c0 = (e0 / x);
+        const OpenMesh::Vec2f c1 = (e1 - e0 * e2_comp_x / x) / y;
+        // E(A) = trace(AA') / det(A)
+        // calculate the \partial{E(A)} / \partial{p0.x} and \partial{E(A)}/ \partial{p0.y}
+        double mdet = c0[0] * c1[1] - c0[1] * c1[0];
+        if (mdet < 0.0f)
+            mdet = -mdet;
+        double traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
+        double ene = traTa / mdet;
+        
+        if (std::isinf(ene) || std::isnan(ene)) {
+            return std::numeric_limits<double>().infinity();
+        }
+
+        E += traTa / mdet;
+    }
+    
+    return E;
+}
+
+void gradientDescent(const Mesh& mesh, std::vector<OpenMesh::Vec2f>& init, double step = 0.0000001f) {
+    constexpr double threshold = 0.000005f;
     auto res = init;
     auto norm = [](const decltype(init) vecs) {
-        return std::accumulate(vecs.begin(), vecs.end(), 0.0f, [](float accum,  const OpenMesh::Vec2f& e){ return accum + OpenMesh::dot(e,e);});
+        return std::accumulate(vecs.begin(), vecs.end(), 0.0f, [](double accum,  const OpenMesh::Vec2f& e){ return accum + OpenMesh::dot(e,e);});
     };
     int op_step = 0;
     std::vector<OpenMesh::Vec2f> grad;
+    grad = calcGrad(mesh, init);
+    std::ofstream grado("grad.csv");
+    grado << "x,y\n";
+    for (auto v: grad)
+        grado << v[0] << "," << v[1] << "\n";
+    double en0 = energy(mesh, init);
     do {
-        std::cout << op_step++ << " Energy: " << energy(mesh, init) << std::endl;
+        std::cout << op_step++ << " Energy: " << en0 << std::endl;
         grad = calcGrad(mesh, init);
-        int i = 0;
-        std::for_each(init.begin(), init.end(), [&i, &grad, &step](OpenMesh::Vec2f& e){e -= step * grad[i++];});
-    } while(norm(grad) >= threshold);
+        for (int i = 0; i < init.size(); ++i)
+            init[i] -= step * grad[i];
+        double en1 = energy(mesh, init);
+        if (abs(en1 - en0) < threshold) 
+            return ;
+        en0 = en1;
+    } while(true);
 
     return ;
 }
 
-// !Todo
-void newton(Mesh& mesh, std::vector<OpenMesh::Vec2f> &vecs, double error) {
-    Eigen::VectorXd x, gradx;
-    Eigen::SparseMatrix<double> Heissein;
-
-    for (auto it = mesh.vertices_begin(); it != mesh.vertices_end(); ++it) {
-        // 1-ring neighborhood
-        auto st = mesh.vv_begin(it);
-        for (auto iv = mesh.vv_begin(it); iv.is_valid(); ) {
-            auto nx = (++iv).is_valid() ? iv : st;
-            auto e1 = mesh.point(iv) - mesh.point(it);
-            auto e2 = mesh.point(nx) - mesh.point(it);
-
-            auto a = e1.norm();
-            auto b = OpenMesh::dot(e1, e2) / a;
-            b = sqrtf(e2.norm() * e2.norm() - b * b);
-        } 
+// choose the step length satisfying the Wolfe condition
+double enei;
+double getStepLength(double alpha0, const Mesh& mesh, const Eigen::VectorXd& params, const Eigen::VectorXd& p, const Eigen::VectorXd& grad) {
+    constexpr double c1 = 1e-4;
+    double ene0 = energy(mesh, params);
+    enei = energy(mesh, params + alpha0 * p);
+    double dphi = p.dot(grad);
+    while (enei > ene0) {
+        alpha0 /= 2.0;
+        enei = energy(mesh, params + alpha0 * p);
     }
+    double inite = enei, inite0 = ene0;
+    double init = alpha0;
+    if (enei < ene0 + c1 * alpha0 * dphi)
+        return  alpha0;
+    double alpha = - dphi * alpha0 * alpha0 / (2.0f * (enei - ene0 - dphi * alpha0));
+    double enei_0 = enei; // energy_{i-1}
+    enei = energy(mesh, params + alpha * p);
+    std::cout << alpha << " " << enei << std::endl;
+    while (!(enei < ene0 + c1 * alpha * dphi)) {
+        // calculate the coeff of the cubic interpolation
+        double dim0 = enei - ene0 - dphi * alpha;
+        double dim1 = enei_0 - ene0 - dphi * alpha0;
+        double numerator = 1.0f / (alpha0 * alpha0 * alpha * alpha * (alpha - alpha0));
+
+        double a = (alpha0 * alpha0 * dim0 - alpha * alpha * dim1) * numerator;
+        double b = (-alpha0 * alpha0 * alpha0 * dim0 + alpha * alpha * alpha * dim1) * numerator;
+        // calculate the aplha
+        alpha0 = alpha;
+        alpha = -b + sqrtf(b * b - 3 * a *dphi) / (3 * a);
+        // update 
+        enei_0 = enei;
+        enei = energy(mesh, params + alpha * p);
+    }
+    return alpha;
+}
+
+// !Todo
+// Use Quasi-Newton method to minimize the energy
+void quasiNewton(Mesh& mesh, std::vector<OpenMesh::Vec2f> &vecs, double error = 0.0005) {
+    const size_t dim = vecs.size() * 2;
+    Eigen::VectorXd x(dim), x0(dim), gradx(dim), gradx0(dim), sk(dim), yk(dim), p(dim);
+    Eigen::MatrixXd Bk(dim, dim);
+    size_t step = 0;
+    // initialize the data
+    double step_len = 1e-5f;
+    Bk.setIdentity();
+    for (int i = 0; i < vecs.size(); ++i) {
+        x0[2 * i] = vecs[i][0];
+        x0[2 * i + 1] = vecs[i][1];
+    }
+    gradx0 = calcGrad(mesh, x0);
+
+    do {
+        p = -Bk * gradx0;
+        step_len = getStepLength(step_len, mesh, x0, p, gradx0);
+        sk = step_len * p;
+        x = x0 + sk;
+        gradx = calcGrad(mesh, x);
+        yk = gradx - gradx0;
+        // update the H0
+        std::cout << "updating" << Bk.size()  << " " << vecs.size() << std::endl;
+        if (step == 0) {
+           double entry = yk.dot(sk) / yk.dot(yk); 
+           for (int i = 0; i < vecs.size(); ++i)
+                Bk.coeffRef(i,i) = entry;
+        }
+        // update Bk
+        std::cout << "updating2" << std::endl;
+        auto skTB_k = sk.transpose() * Bk;
+        auto num = (skTB_k * sk);
+        Bk = Bk - Bk * sk * skTB_k / num  + (yk * yk.transpose()) / (yk.dot(sk));
+        std::swap(x, x0);
+        std::swap(gradx, gradx0);
+        ++step;
+        std::cout << "Steps: " << step << " " << "energy: " << enei << " Length: " << step_len << std::endl;
+    } while (gradx0.norm() > error);
+
+    // send it back to the caller
+    for (int i = 0; i < vecs.size(); ++i) {
+         vecs[i][0] = x0[2 * i];
+         vecs[i][1] = x0[2 * i + 1];
+    }
+    return ;
 }
 
 std::vector<OpenMesh::Vec2f> paratimization(Mesh& mesh, double error) {
     mesh.triangulate();
     auto init_param = init(mesh); // the initial parameterization for the mesh
-    // newton(mesh, init_param, error); // optimize the parameterization using Quasi Newton Method
     std::cout << "Initialization complete.\n";
-    gradientDescent(mesh, init_param);
+    // gradientDescent(mesh, init_param);
+    quasiNewton(mesh, init_param);
     std::cout << "Optimization complete.\n";
     return std::move(init_param);
 }
