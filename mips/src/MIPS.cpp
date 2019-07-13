@@ -388,51 +388,222 @@ double getStepLength(double alpha0, const Mesh& mesh, const Eigen::VectorXd& par
     return alpha;
 }
 
+void updateHeissan(Eigen::SparseMatrix<double>& H, const Mesh& mesh, const Eigen::VectorXd& vecs) {
+    constexpr int coord = 2;
+    H.setZero();
+    for (auto v = mesh.vertices_begin(); v != mesh.vertices_end(); ++v) {
+        for (auto face: mesh.vf_range(v)){
+            int cnt = 0;
+            OpenMesh::VertexHandle nv, nx;
+            for (auto adjv: mesh.fv_range(face)) {
+                if (adjv != v) {
+                    if (cnt++ == 0)
+                        nv = adjv;
+                    else nx = adjv;
+                }
+            }
+            auto E1 = mesh.point(nv) - mesh.point(v);
+            auto E2 = mesh.point(nx) - mesh.point(v);
+
+            double x = E1.norm();
+            double e2_comp_x = OpenMesh::dot(E1, E2) / x;
+            double y = sqrtf(E2.norm() * E2.norm() - e2_comp_x * e2_comp_x);
+
+            // The Matrix A = ((p1 - p0) / x, ((p2 - p0) - (p1 - p0) * e2_comp_x / x) / y)
+            // calculate the row vector of Matrix A
+            const OpenMesh::Vec2f& p0 = OpenMesh::Vec2f(vecs[coord * v.handle().idx()], vecs[coord * v.handle().idx() + 1]);
+            const OpenMesh::Vec2f& p1 = OpenMesh::Vec2f(vecs[coord * nv.idx()], vecs[coord * nv.idx() + 1]);
+            const OpenMesh::Vec2f& p2 = OpenMesh::Vec2f(vecs[coord * nx.idx()], vecs[coord * nx.idx() + 1]);
+            const OpenMesh::Vec2f e0 = p1 - p0;
+            const OpenMesh::Vec2f e1 = p2 - p0;
+            const OpenMesh::Vec2f c0 = (e0 / x);
+            const OpenMesh::Vec2f c1 = (e1 - e0 * e2_comp_x / x) / y;
+            // E(A) = trace(AA') / det(A)
+            // calculate the \partial{E(A)} / \partial{p0.x} and \partial{E(A)}/ \partial{p0.y}
+            double mdet = c0[0] * c1[1] - c0[1] * c1[0];
+            double traTa = OpenMesh::dot(c0, c0) + OpenMesh::dot(c1, c1);
+            double dtraTa_dx = 2 * c0[0] / (-x) + 2 * c1[0] * (e2_comp_x / x - 1.0) / y;
+            double dtraTa_dy = 2 * c0[1] / (-x) + 2 * c1[1] * (e2_comp_x / x - 1.0) / y;
+            double dDet_dx = c1[1] / (-x) - c0[1] * (e2_comp_x / x - 1.0) / y;
+            double dDet_dy = c0[0] * (e2_comp_x / x - 1.0) / y - c1[0] / (-x);
+            double dDet_dxp1 = c1[1] / x - c0[1] * -e2_comp_x / (x * y);
+            double dDet_dyp1 = -e2_comp_x / (x * y) * c0[0] - c1[0] / x;
+            double dDet_dxp2 = -c0[1] / (x * y);
+            double dDet_dyp2 = c0[0] / (x * y);
+            double dTr_dxp1 = 2.0 * c0[0] / x - 2.0 * e2_comp_x / x * c1[0];
+            double dTr_dyp1 = 2.0 * c0[1] / x - 2.0 * e2_comp_x / x * c1[1];
+            double dTr_dxp2 = 2.0 * c1[0] / y;
+            double dTr_dyp2 = 2.0 * c1[1] / y;
+            if (mdet < 0.0f) {
+                mdet = -mdet;
+                dDet_dx = -dDet_dx;
+                dDet_dy = -dDet_dy;
+                dDet_dxp1 = -dDet_dxp1;
+                dDet_dyp1 = -dDet_dyp1;
+                dDet_dxp2 = -dDet_dxp2;
+                dDet_dyp2 = -dDet_dyp2;
+            }
+
+            // res[coord * v.handle().idx()] += (dtraTa_dx * mdet - traTa * dDet_dx)/ (mdet * mdet);
+            // res[coord * v.handle().idx() + 1] += (dtraTa_dy * mdet - traTa * dDet_dy)/ (mdet * mdet);
+
+            double fx = dtraTa_dx * mdet - traTa * dDet_dx;
+            double mdet4 = mdet * mdet * mdet * mdet;
+            // compute dE / dp0_x dp0_x
+            {
+                int r = coord * v.handle().idx(), c =  coord * v.handle().idx();
+                double dfx = (2.0 / (x * x) + 2.0 * (e2_comp_x / x - 1.0) / y *  (e2_comp_x / x - 1.0) / y)* mdet 
+                + dtraTa_dx * dDet_dx - dtraTa_dx * dDet_dx;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dx) / mdet4;
+            }
+
+            // compute dE / dp0_x dp0_y
+            {
+                int r = coord * v.handle().idx(), c = coord * v.handle().idx() + 1;
+                double dfx = dtraTa_dx * dDet_dy - dtraTa_dy * dDet_dx;
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dy) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dy) / mdet4;
+            }
+
+            // dE / dp0_x dp1_x
+            {
+                int r = coord * v.handle().idx(), c = coord * nv.idx();
+                double dtra_dxdxp1 = -2.0 / (x*x) + 2.0 * (e2_comp_x / x - 1.0) / y * -e2_comp_x / (x*y);
+                double dfx = dtra_dxdxp1 * mdet + dtraTa_dx * dDet_dxp1
+                - dTr_dxp1 * dDet_dx;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp1) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp1) / mdet4;
+            }
+
+            // dE / dp0_x dp1_y
+            {
+                int r = coord * v.handle().idx(), c = coord * nv.idx() + 1;
+                double dDet_dxdyp1 = -e2_comp_x / (x * y * -x) - (e2_comp_x / x - 1.0) / (x * y);
+                if (mdet < 0)
+                    dDet_dxdyp1 = -dDet_dxdyp1;
+                double dfx = dtraTa_dx * dDet_dyp1 - dTr_dyp1 * dDet_dx - traTa * dDet_dxdyp1;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp1) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp1) / mdet4;
+            }
+
+            // dE / dp0_x dp2_x
+            {
+                int r = coord * v.handle().idx(), c = coord * nx.idx();
+                double dtra_dxdxp2 = 2 * (e2_comp_x / x - 1.0) / (y * y);
+                double dfx = dtra_dxdxp2 * mdet + dtraTa_dx * dDet_dxp2 - dTr_dxp2 * dDet_dx;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp2) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp2) / mdet4;
+            }
+            // dE / dp0_x dp2_y
+            {
+                int r = coord * v.handle().idx(), c = coord * nx.idx() + 1;
+                double dDet_dxdyp2 = 1.0 / (-x * y);
+                if (mdet < 0)
+                    dDet_dxdyp2 = -dDet_dxdyp2;
+                double dfx = dtraTa_dx * dDet_dyp2 - dTr_dyp2 * dDet_dx - traTa * dDet_dxdyp2;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp2) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp2) / mdet4;
+            }
+
+            // dE / dp0_y dp0_x
+            {
+                int r = coord * v.handle().idx() + 1, c =  coord * v.handle().idx();
+                double dfx = dtraTa_dy * dDet_dx - dtraTa_dx * dDet_dy;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dx) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dx) / mdet4;
+            }
+
+            // compute dE / dp0_y dp0_y
+            {
+                int r = coord * v.handle().idx() + 1, c = coord * v.handle().idx() + 1;
+                double dfx =(2.0 / (x * x) + 2.0 * (e2_comp_x / x - 1.0) / y *  (e2_comp_x / x - 1.0) / y)* mdet;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dy) / mdet4;
+            }
+
+            // dE / dp0_y dp1_x
+            {
+                int r = coord * v.handle().idx() + 1, c = coord * nv.idx();
+                double dDet_dydxp1 = (e2_comp_x / x - 1.0) / (x * y) +  e2_comp_x/ (-x * x * y);
+                if (mdet < 0)
+                    dDet_dydxp1 = -dDet_dydxp1;
+                double dfx = dtraTa_dy * dDet_dyp1 - dTr_dyp1 * dDet_dy - traTa * dDet_dydxp1;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp1) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp1) / mdet4;
+            }
+
+            // dE / dp0_y dp1_y
+            {
+                int r = coord * v.handle().idx() + 1, c = coord * nv.idx() + 1;
+                double dTr_dydyp1 = 2.0 / (-x * x) +  2 * (-e2_comp_x / (x * y)) * (e2_comp_x / x - 1.0) / y;
+                double dfx = dTr_dydyp1 * mdet + dtraTa_dy * dDet_dyp1 - dTr_dyp1 * dDet_dy;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp1) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp1) / mdet4;
+            }
+
+            // dE / dp0_y dp2_x
+            {
+                int r = coord * v.handle().idx() + 1, c = coord * nx.idx();
+                double dDet_dydxp2 = -1.0 / (-x * y);
+                if (mdet < 0)
+                    dDet_dydxp2 = -dDet_dydxp2;
+                double dfx = dtraTa_dy * dDet_dxp2 - dTr_dxp2 * dDet_dy - traTa * dDet_dydxp2;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp2) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dxp2) / mdet4;
+            }
+            // dE / dp0_y dp2_y
+            {
+                int r = coord * v.handle().idx() + 1, c = coord * nx.idx() + 1;
+                double dTr_dydyp2 = 2 * (e2_comp_x / x - 1.0) / (y* y);
+                double dfx = dTr_dydyp2 * mdet + dtraTa_dy * dDet_dyp2 - dTr_dyp2 * dDet_dy;
+
+                H.coeffRef(r, c) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp2) / mdet4;
+                H.coeffRef(c, r) += (dfx * mdet * mdet - 2.0 * fx * mdet * dDet_dyp2) / mdet4;
+            }
+        }
+    }
+}
 // !Todo
 // Use Quasi-Newton method to minimize the energy
 void quasiNewton(Mesh& mesh, std::vector<OpenMesh::Vec2f> &vecs, double error = 0.0005) {
     const size_t dim = vecs.size() * 2;
-    Eigen::VectorXd x(dim), x0(dim), gradx(dim), gradx0(dim), sk(dim), yk(dim), p(dim);
-    Eigen::MatrixXd Bk(dim, dim);
+    Eigen::VectorXd x(dim), gradx(dim), p(dim);
+    std::cout << "init" << vecs.size() << std::endl;
+    Eigen::SparseMatrix<double> H(dim, dim);
+    std::cout << "init";
     size_t step = 0;
     // initialize the data
     double step_len = 1e-5f;
-    Bk.setIdentity();
     for (int i = 0; i < vecs.size(); ++i) {
-        x0[2 * i] = vecs[i][0];
-        x0[2 * i + 1] = vecs[i][1];
+        x[2 * i] = vecs[i][0];
+        x[2 * i + 1] = vecs[i][1];
     }
-    gradx0 = calcGrad(mesh, x0);
-
+    Eigen::SimplicialLDLT<decltype(H)> solver;
     do {
-        p = -Bk * gradx0;
-        step_len = getStepLength(step_len, mesh, x0, p, gradx0);
-        sk = step_len * p;
-        x = x0 + sk;
+        std::cout << "Heissain";
+        updateHeissan(H, mesh, x);
+        std::cout << "grad";
         gradx = calcGrad(mesh, x);
-        yk = gradx - gradx0;
-        // update the H0
-        std::cout << "updating" << Bk.size()  << " " << vecs.size() << std::endl;
-        if (step == 0) {
-           double entry = yk.dot(sk) / yk.dot(yk); 
-           for (int i = 0; i < vecs.size(); ++i)
-                Bk.coeffRef(i,i) = entry;
-        }
-        // update Bk
-        std::cout << "updating2" << std::endl;
-        auto skTB_k = sk.transpose() * Bk;
-        auto num = (skTB_k * sk);
-        Bk = Bk - Bk * sk * skTB_k / num  + (yk * yk.transpose()) / (yk.dot(sk));
-        std::swap(x, x0);
-        std::swap(gradx, gradx0);
-        ++step;
+        p = solver.compute(H).solve(-gradx);
+        std::cout << "solve";
+        step_len = getStepLength(step_len, mesh, x, p, gradx);
+        x += step_len * p;
         std::cout << "Steps: " << step << " " << "energy: " << enei << " Length: " << step_len << std::endl;
-    } while (gradx0.norm() > error);
+    } while (gradx.norm() > error);
 
     // send it back to the caller
     for (int i = 0; i < vecs.size(); ++i) {
-         vecs[i][0] = x0[2 * i];
-         vecs[i][1] = x0[2 * i + 1];
+         vecs[i][0] = x[2 * i];
+         vecs[i][1] = x[2 * i + 1];
     }
     return ;
 }
